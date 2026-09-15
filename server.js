@@ -1,60 +1,312 @@
 const express = require('express');
 const cors = require('cors');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.6-luna';
+
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));
 
-const users = [], messages = [], transactions = [], gifts = [];
+const users = [];
+const messages = [];
+const transactions = [];
+const gifts = [];
+const aiRate = new Map();
+
 const catalog = [
-  { id:'rose', name:'Роза', emoji:'🌹', price:100 },
-  { id:'diamond', name:'Алмаз', emoji:'💎', price:500 },
-  { id:'rocket', name:'Ракета', emoji:'🚀', price:1000 },
-  { id:'galaxy', name:'Галактика', emoji:'🌌', price:2500 },
-  { id:'crown', name:'Корона', emoji:'👑', price:5000 }
+  { id: 'rose', name: 'Роза', emoji: '🌹', price: 100 },
+  { id: 'diamond', name: 'Алмаз', emoji: '💎', price: 500 },
+  { id: 'rocket', name: 'Ракета', emoji: '🚀', price: 1000 },
+  { id: 'galaxy', name: 'Галактика', emoji: '🌌', price: 2500 },
+  { id: 'crown', name: 'Корона', emoji: '👑', price: 5000 }
 ];
-const clean = v => String(v || '').replace(/^@/,'').trim().toLowerCase();
-const findUser = u => users.find(x => x.username === clean(u));
-const publicUser = u => u && ({id:u.id,username:u.username,name:u.name,avatar:u.avatar,cosmics:u.cosmics,createdAt:u.createdAt,lastSeen:u.lastSeen||null});
-const addTx = (username, amount, type, description) => transactions.push({id:transactions.length+1,username,amount,type,description,createdAt:new Date().toISOString()});
-const online = u => !!(u && u.lastSeen && Date.now()-new Date(u.lastSeen).getTime()<90000);
 
-app.get('/',(_q,r)=>r.json({app:'CosmoMes',version:'3.1',status:'online'}));
-app.get('/health',(_q,r)=>r.json({ok:true,service:'CosmoMes',time:new Date().toISOString()}));
+const clean = value => String(value || '').replace(/^@/, '').trim().toLowerCase();
+const findUser = username => users.find(u => u.username === clean(username));
+const isOnline = user => user && user.lastSeen && Date.now() - new Date(user.lastSeen).getTime() < 90000;
 
-app.post('/register',(q,r)=>{
- const username=clean(q.body.username),name=String(q.body.name||'').trim();
- if(!username||!name)return r.status(400).json({error:'Username и имя обязательны'});
- if(!/^[a-z0-9_]{3,24}$/i.test(username))return r.status(400).json({error:'Username: 3-24 символа, только буквы, цифры и _'});
- if(findUser(username))return r.status(409).json({error:'Такой username уже существует'});
- const u={id:users.length+1,username,name:name.slice(0,40),avatar:username[0].toUpperCase(),cosmics:1000,createdAt:new Date().toISOString(),lastSeen:new Date().toISOString()};
- users.push(u);addTx(username,1000,'bonus','Стартовый бонус CosmoMes');r.json({success:true,user:publicUser(u)});
+function publicUser(user) {
+  return user && {
+    id: user.id,
+    username: user.username,
+    name: user.name,
+    avatar: user.avatar,
+    cosmics: user.cosmics,
+    createdAt: user.createdAt,
+    lastSeen: user.lastSeen || null,
+    online: Boolean(isOnline(user))
+  };
+}
+
+function addTx(username, amount, type, description) {
+  transactions.push({
+    id: transactions.length + 1,
+    username,
+    amount,
+    type,
+    description,
+    createdAt: new Date().toISOString()
+  });
+}
+
+app.get('/', (_, res) => res.json({
+  app: 'CosmoMes',
+  version: '3.2',
+  status: 'online',
+  ai: Boolean(OPENAI_API_KEY)
+}));
+
+app.get('/health', (_, res) => res.json({ ok: true, version: '3.2' }));
+
+app.post('/register', (req, res) => {
+  const username = clean(req.body.username);
+  const name = String(req.body.name || '').trim();
+
+  if (!username || !name) return res.status(400).json({ error: 'Username и имя обязательны' });
+  if (!/^[a-z0-9_]{3,24}$/i.test(username)) {
+    return res.status(400).json({ error: 'Username: только латинские буквы, цифры и _ (3–24 символа)' });
+  }
+  if (findUser(username)) return res.status(409).json({ error: 'Такой username уже существует' });
+
+  const user = {
+    id: users.length + 1,
+    username,
+    name: name.slice(0, 40),
+    avatar: username[0].toUpperCase(),
+    cosmics: 1000,
+    createdAt: new Date().toISOString(),
+    lastSeen: new Date().toISOString()
+  };
+
+  users.push(user);
+  addTx(username, 1000, 'bonus', 'Стартовый бонус CosmoMes');
+  res.json({ success: true, user: publicUser(user) });
 });
-app.post('/presence',(q,r)=>{const u=findUser(q.body.username);if(!u)return r.status(404).json({error:'Пользователь не найден'});u.lastSeen=new Date().toISOString();r.json({success:true,online:true,lastSeen:u.lastSeen});});
-app.get('/users',(_q,r)=>r.json(users.map(u=>({...publicUser(u),online:online(u)}))));
-app.get('/profile',(q,r)=>{const u=findUser(q.query.username);if(!u)return r.status(404).json({error:'Пользователь не найден'});r.json({...publicUser(u),online:online(u)});});
-app.post('/profile',(q,r)=>{const u=findUser(q.body.username);if(!u)return r.status(404).json({error:'Пользователь не найден'});if(q.body.name!==undefined)u.name=String(q.body.name).trim().slice(0,40)||u.name;if(q.body.avatar!==undefined)u.avatar=String(q.body.avatar).trim().slice(0,2)||u.avatar;r.json({success:true,user:publicUser(u)});});
 
-app.post('/messages',(q,r)=>{
- const from=clean(q.body.from),to=clean(q.body.to),text=String(q.body.text||'').trim();
- if(!from||!to||!text)return r.status(400).json({error:'Недостаточно данных'});
- if(!findUser(from)||!findUser(to))return r.status(404).json({error:'Пользователь не найден'});
- const m={id:messages.length+1,from,to,text:text.slice(0,4000),createdAt:new Date().toISOString()};messages.push(m);r.json({success:true,message:m});
+app.post('/presence', (req, res) => {
+  const user = findUser(req.body.username);
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+  user.lastSeen = new Date().toISOString();
+  res.json({ success: true, online: true });
 });
-app.get('/messages',(q,r)=>{const a=clean(q.query.user1),b=clean(q.query.user2);r.json(messages.filter(m=>(m.from===a&&m.to===b)||(m.from===b&&m.to===a)));});
 
-app.get('/cosmics',(q,r)=>{const u=findUser(q.query.username);if(!u)return r.status(404).json({error:'Пользователь не найден'});r.json({balance:u.cosmics,history:transactions.filter(x=>x.username===u.username).slice(-30).reverse()});});
-app.post('/cosmics/give',(q,r)=>{const a=findUser(q.body.from),b=findUser(q.body.to),n=Number(q.body.amount);if(!a||!b)return r.status(404).json({error:'Пользователь не найден'});if(a===b)return r.status(400).json({error:'Нельзя переводить самому себе'});if(!Number.isInteger(n)||n<=0)return r.status(400).json({error:'Некорректная сумма'});if(a.cosmics<n)return r.status(400).json({error:'Недостаточно Космиков'});a.cosmics-=n;b.cosmics+=n;addTx(a.username,-n,'transfer',`Перевод @${b.username}`);addTx(b.username,n,'transfer',`Получено от @${a.username}`);r.json({success:true,from:publicUser(a),to:publicUser(b)});});
+app.get('/users', (_, res) => res.json(users.map(publicUser)));
 
-app.get('/gifts/catalog',(_q,r)=>r.json(catalog));
-app.get('/gifts',(q,r)=>r.json(gifts.filter(g=>g.to===clean(q.query.username)).reverse()));
-app.post('/gifts/send',(q,r)=>{const a=findUser(q.body.from),b=findUser(q.body.to),g=catalog.find(x=>x.id===q.body.giftId);if(!a||!b||!g)return r.status(404).json({error:'Данные не найдены'});if(a.cosmics<g.price)return r.status(400).json({error:'Недостаточно Космиков'});a.cosmics-=g.price;const item={id:gifts.length+1,giftId:g.id,giftName:g.name,emoji:g.emoji,price:g.price,from:a.username,to:b.username,createdAt:new Date().toISOString()};gifts.push(item);addTx(a.username,-g.price,'gift',`Подарок ${g.emoji} @${b.username}`);r.json({success:true,gift:item,balance:a.cosmics});});
+app.get('/profile', (req, res) => {
+  const user = findUser(req.query.username);
+  user ? res.json(publicUser(user)) : res.status(404).json({ error: 'Пользователь не найден' });
+});
 
-app.post('/bot',(q,r)=>{const u=findUser(q.body.username),text=String(q.body.text||'').trim(),p=text.split(/\s+/),cmd=(p[0]||'').toLowerCase();if(!u)return r.status(404).json({error:'Пользователь не найден'});if(cmd==='/start'||cmd==='/help')return r.json({reply:'🤖 CosmoBot\n\n/balance — баланс\n/give @username 100 — перевод\n/gifts — мои подарки\n/help — помощь'});if(cmd==='/balance')return r.json({reply:`💫 Ваш баланс: ${u.cosmics} ✦`});if(cmd==='/gifts'){const gs=gifts.filter(g=>g.to===u.username);return r.json({reply:gs.length?'🎁 Ваши подарки:\n\n'+gs.slice(-10).reverse().map(g=>`${g.emoji} ${g.giftName} от @${g.from}`).join('\n'):'🎁 У вас пока нет подарков.'});}if(cmd==='/give'){const b=findUser(p[1]),n=Number(p[2]);if(!b||!Number.isInteger(n)||n<=0)return r.json({reply:'❌ Использование: /give @username 100'});if(b===u)return r.json({reply:'❌ Нельзя переводить самому себе.'});if(u.cosmics<n)return r.json({reply:'❌ Недостаточно Космиков.'});u.cosmics-=n;b.cosmics+=n;addTx(u.username,-n,'transfer',`Перевод @${b.username}`);addTx(b.username,n,'transfer',`Получено от @${u.username}`);return r.json({reply:`✅ Переведено ${n} ✦ пользователю @${b.username}.`});}r.json({reply:'🤖 Не знаю такую команду. Напиши /help.'});});
+app.post('/profile', (req, res) => {
+  const user = findUser(req.body.username);
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
 
-app.post('/admin/login',(q,r)=>{if(!ADMIN_PASSWORD)return r.status(503).json({error:'ADMIN_PASSWORD не настроен на сервере'});if(String(q.body.password||'')!==ADMIN_PASSWORD)return r.status(401).json({error:'Неверный пароль'});r.json({success:true});});
-app.get('/admin/users',(q,r)=>{if(!ADMIN_PASSWORD||String(q.query.password||'')!==ADMIN_PASSWORD)return r.status(401).json({error:'Нет доступа'});r.json(users.map(u=>({...publicUser(u),online:online(u)})));});
-app.post('/admin/give',(q,r)=>{if(!ADMIN_PASSWORD||String(q.body.password||'')!==ADMIN_PASSWORD)return r.status(401).json({error:'Нет доступа'});const u=findUser(q.body.to),n=Number(q.body.amount);if(!u||!Number.isInteger(n)||n<=0)return r.status(400).json({error:'Некорректные данные'});u.cosmics+=n;addTx(u.username,n,'admin','Начисление от администратора');r.json({success:true,user:publicUser(u)});});
+  if (req.body.name !== undefined) user.name = String(req.body.name).trim().slice(0, 40) || user.name;
+  if (req.body.avatar !== undefined) user.avatar = String(req.body.avatar).trim().slice(0, 2) || user.avatar;
+  user.lastSeen = new Date().toISOString();
 
-app.listen(PORT,'0.0.0.0',()=>console.log(`🚀 CosmoMes server 3.1 on port ${PORT}`));
+  res.json({ success: true, user: publicUser(user) });
+});
+
+app.post('/messages', (req, res) => {
+  const from = clean(req.body.from);
+  const to = clean(req.body.to);
+  const text = String(req.body.text || '').trim();
+  const sender = findUser(from);
+  const receiver = findUser(to);
+
+  if (!from || !to || !text) return res.status(400).json({ error: 'Недостаточно данных' });
+  if (!sender || !receiver) return res.status(404).json({ error: 'Пользователь не найден' });
+
+  sender.lastSeen = new Date().toISOString();
+  const message = {
+    id: messages.length + 1,
+    from,
+    to,
+    text: text.slice(0, 4000),
+    createdAt: new Date().toISOString()
+  };
+  messages.push(message);
+  res.json({ success: true, message });
+});
+
+app.get('/messages', (req, res) => {
+  const a = clean(req.query.user1);
+  const b = clean(req.query.user2);
+  res.json(messages.filter(m => (m.from === a && m.to === b) || (m.from === b && m.to === a)));
+});
+
+app.get('/cosmics', (req, res) => {
+  const user = findUser(req.query.username);
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+  res.json({
+    balance: user.cosmics,
+    history: transactions.filter(t => t.username === user.username).slice(-50).reverse()
+  });
+});
+
+app.post('/cosmics/give', (req, res) => {
+  const from = findUser(req.body.from);
+  const to = findUser(req.body.to);
+  const amount = Number(req.body.amount);
+
+  if (!from || !to) return res.status(404).json({ error: 'Пользователь не найден' });
+  if (from === to) return res.status(400).json({ error: 'Нельзя переводить самому себе' });
+  if (!Number.isInteger(amount) || amount <= 0) return res.status(400).json({ error: 'Некорректная сумма' });
+  if (from.cosmics < amount) return res.status(400).json({ error: 'Недостаточно Космиков' });
+
+  from.cosmics -= amount;
+  to.cosmics += amount;
+  addTx(from.username, -amount, 'transfer', `Перевод @${to.username}`);
+  addTx(to.username, amount, 'transfer', `Получено от @${from.username}`);
+  res.json({ success: true, from: publicUser(from), to: publicUser(to) });
+});
+
+app.get('/gifts/catalog', (_, res) => res.json(catalog));
+app.get('/gifts', (req, res) => res.json(gifts.filter(g => g.to === clean(req.query.username)).reverse()));
+
+app.post('/gifts/send', (req, res) => {
+  const from = findUser(req.body.from);
+  const to = findUser(req.body.to);
+  const gift = catalog.find(g => g.id === req.body.giftId);
+
+  if (!from || !to || !gift) return res.status(404).json({ error: 'Данные не найдены' });
+  if (from.cosmics < gift.price) return res.status(400).json({ error: 'Недостаточно Космиков' });
+
+  from.cosmics -= gift.price;
+  const item = {
+    id: gifts.length + 1,
+    giftId: gift.id,
+    giftName: gift.name,
+    emoji: gift.emoji,
+    price: gift.price,
+    from: from.username,
+    to: to.username,
+    createdAt: new Date().toISOString()
+  };
+  gifts.push(item);
+  addTx(from.username, -gift.price, 'gift', `Подарок ${gift.emoji} @${to.username}`);
+  res.json({ success: true, gift: item, balance: from.cosmics });
+});
+
+app.post('/bot', (req, res) => {
+  const user = findUser(req.body.username);
+  const text = String(req.body.text || '').trim();
+  const parts = text.split(/\s+/);
+  const cmd = (parts[0] || '').toLowerCase();
+
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+  user.lastSeen = new Date().toISOString();
+
+  if (cmd === '/start' || cmd === '/help') {
+    return res.json({ reply: '🤖 CosmoBot\n\n/balance — баланс\n/give @username 100 — перевод\n/gifts — мои подарки\n/help — помощь' });
+  }
+  if (cmd === '/balance') return res.json({ reply: `💫 Ваш баланс: ${user.cosmics} ✦` });
+  if (cmd === '/gifts') {
+    const own = gifts.filter(g => g.to === user.username);
+    return res.json({ reply: own.length ? '🎁 Ваши подарки:\n\n' + own.slice(-10).reverse().map(g => `${g.emoji} ${g.giftName} от @${g.from}`).join('\n') : '🎁 У вас пока нет подарков.' });
+  }
+  if (cmd === '/give') {
+    const target = findUser(parts[1]);
+    const amount = Number(parts[2]);
+    if (!target || !Number.isInteger(amount) || amount <= 0) return res.json({ reply: '❌ Использование: /give @username 100' });
+    if (target.username === user.username) return res.json({ reply: '❌ Нельзя переводить самому себе.' });
+    if (user.cosmics < amount) return res.json({ reply: '❌ Недостаточно Космиков.' });
+    user.cosmics -= amount;
+    target.cosmics += amount;
+    addTx(user.username, -amount, 'transfer', `Перевод @${target.username}`);
+    addTx(target.username, amount, 'transfer', `Получено от @${user.username}`);
+    return res.json({ reply: `✅ Переведено ${amount} ✦ пользователю @${target.username}.` });
+  }
+  return res.json({ reply: '🤖 Не знаю такую команду. Напиши /help.' });
+});
+
+app.post('/admin/login', (req, res) => {
+  if (!ADMIN_PASSWORD) return res.status(503).json({ error: 'ADMIN_PASSWORD не настроен на сервере' });
+  const user = findUser(req.body.username);
+  if (!user || String(req.body.password || '') !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Неверный пароль' });
+  }
+  user.lastSeen = new Date().toISOString();
+  res.json({ success: true });
+});
+
+app.get('/admin/users', (req, res) => {
+  if (!ADMIN_PASSWORD || String(req.query.password || '') !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Нет доступа' });
+  res.json(users.map(u => ({ ...publicUser(u), online: Boolean(isOnline(u)) })));
+});
+
+app.post('/admin/give', (req, res) => {
+  if (!ADMIN_PASSWORD || String(req.body.password || '') !== ADMIN_PASSWORD) return res.status(401).json({ error: 'Нет доступа' });
+
+  const admin = findUser(req.body.username);
+  const target = findUser(req.body.to);
+  const amount = Number(req.body.amount);
+
+  if (!admin) return res.status(404).json({ error: 'Администратор не найден' });
+  if (!target) return res.status(404).json({ error: 'Получатель не найден' });
+  if (!Number.isInteger(amount) || amount <= 0) return res.status(400).json({ error: 'Некорректная сумма' });
+
+  target.cosmics += amount;
+  addTx(target.username, amount, 'admin', `Выдано администратором @${admin.username}`);
+  res.json({ success: true, message: `Выдано ${amount} ✦ пользователю @${target.username}`, user: publicUser(target) });
+});
+
+app.post('/ai/chat', async (req, res) => {
+  const user = findUser(req.body.username);
+  const text = String(req.body.text || '').trim();
+
+  if (!user) return res.status(404).json({ error: 'Пользователь не найден' });
+  if (!text) return res.status(400).json({ error: 'Пустой запрос' });
+  if (!OPENAI_API_KEY) return res.status(503).json({ error: 'OPENAI_API_KEY не настроен на сервере' });
+  if (text.length > 4000) return res.status(400).json({ error: 'Сообщение слишком длинное' });
+
+  const now = Date.now();
+  const previous = aiRate.get(user.username) || 0;
+  if (now - previous < 2500) return res.status(429).json({ error: 'Слишком быстро. Подожди пару секунд.' });
+  aiRate.set(user.username, now);
+  user.lastSeen = new Date().toISOString();
+
+  try {
+    const response = await fetch('https://api.openai.com/v1/responses', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        instructions: 'Ты CosmoAI — дружелюбный встроенный ИИ-мессенджера CosmoMes. Отвечай на русском, если пользователь пишет по-русски. Будь полезным и кратким, но можешь подробно объяснять сложные темы.',
+        input: text,
+        max_output_tokens: 800
+      })
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+      console.error('OpenAI error:', data);
+      return res.status(502).json({ error: 'Ошибка AI-сервиса' });
+    }
+
+    const reply = data.output_text || (data.output || [])
+      .filter(item => item.type === 'message')
+      .flatMap(item => item.content || [])
+      .filter(part => part.type === 'output_text')
+      .map(part => part.text)
+      .join('\n')
+      .trim();
+
+    res.json({ reply: reply || '🤖 Я не смог сформировать ответ.' });
+  } catch (error) {
+    console.error('AI request failed:', error);
+    res.status(502).json({ error: 'Не удалось связаться с AI' });
+  }
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 CosmoMes server 3.2 on port ${PORT}`);
+  console.log(`AI: ${OPENAI_API_KEY ? OPENAI_MODEL : 'disabled (set OPENAI_API_KEY)'}`);
+});
