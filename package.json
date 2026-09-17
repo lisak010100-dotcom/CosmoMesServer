@@ -1,14 +1,20 @@
 {
-  "name": "cosmomes-server",
-  "version": "1.0.0",
-  "private": true,
-  "description": "CosmoMes public messenger server",
+  "name": "cosmo-mes-server",
+  "version": "2.0.0",
+  "description": "Backend для мессенджера CosmoMes",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^5.1.0"
-  }
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["messenger", "cosmo", "chat"],
+  "author": "CosmoMes",
+  "license": "MIT"
 }
