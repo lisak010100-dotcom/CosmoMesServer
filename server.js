@@ -1,331 +1,630 @@
+// ============================================================
+//              CosmoMes Server — полная версия 2.0
+// ============================================================
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
-const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5.6-luna';
-
 app.use(cors());
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '10mb' }));
 
-const users = [];
-const messages = [];
-const transactions = [];
-const gifts = [];
-const pendingAuth = new Map();
-const aiRate = new Map();
+const PORT = process.env.PORT || 3000;
+const DATA_FILE = path.join(__dirname, 'data.json');
 
-function clean(value) {
-  return String(value ?? '').trim();
+// ---------- Конфиг ----------
+const ADMIN_LOGIN = process.env.ADMIN_LOGIN || 'admin';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'cosmo2024';
+const ONLINE_WINDOW_MS = 30_000;   // 30 сек — считаем онлайн
+const CODE_TTL_MS = 5 * 60_000;    // код живёт 5 минут
+
+// ============================================================
+//                       ХРАНИЛИЩЕ
+// ============================================================
+let db = {
+  users: [],
+  messages: [],
+  transactions: [],
+  codes: {},       // phone → { code, expiresAt }
+  presence: {},    // username → timestamp (ms)
+  nextUserId: 1,
+  nextMsgId: 1,
+  nextTxId: 1
+};
+
+function loadDb() {
+  if (fs.existsSync(DATA_FILE)) {
+    try {
+      db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      db.codes = db.codes || {};
+      db.presence = db.presence || {};
+      db.users = db.users || [];
+      db.messages = db.messages || [];
+      db.transactions = db.transactions || [];
+      db.nextUserId = db.nextUserId || 1;
+      db.nextMsgId = db.nextMsgId || 1;
+      db.nextTxId = db.nextTxId || 1;
+      console.log(`📂 Загружено: ${db.users.length} юзеров, ${db.messages.length} сообщений`);
+    } catch (e) {
+      console.error('Ошибка чтения data.json:', e.message);
+    }
+  }
 }
 
-function normalizePhone(value) {
-  return clean(value).replace(/[\s()\-]/g, '');
+function saveDb() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+  } catch (e) {
+    console.error('Ошибка записи data.json:', e.message);
+  }
 }
 
-function publicUser(user) {
-  return {
-    id: user.id,
-    username: user.username,
-    name: user.name,
-    avatar: user.avatar || '',
-    phone: user.phone || '',
-    cosmics: user.cosmics || 0,
-    online: !!user.online
-  };
+loadDb();
+setInterval(saveDb, 5000);
+
+// ============================================================
+//                       ХЕЛПЕРЫ
+// ============================================================
+function clean(u) {
+  return String(u || '').replace(/^@/, '').trim().toLowerCase().slice(0, 32);
+}
+
+function isOnline(username) {
+  const t = db.presence[clean(username)];
+  return t && Date.now() - t < ONLINE_WINDOW_MS;
 }
 
 function findUser(username) {
-  const u = clean(username).replace(/^@/, '').toLowerCase();
-  return users.find(x => x.username.toLowerCase() === u);
+  return db.users.find(u => u.username === clean(username));
 }
 
-function validUsername(username) {
-  return /^[a-zA-Z0-9_]{3,32}$/.test(username);
-}
-
-app.get('/', (_req, res) => {
-  res.json({ app: 'CosmoMes', status: 'online', version: '4.0' });
-});
-
-app.get('/health', (_req, res) => {
-  res.json({ ok: true, users: users.length, messages: messages.length, version: '4.0' });
-});
-
-// DEMO phone verification. For real SMS delivery, connect an SMS provider.
-app.post('/auth/request-code', (req, res) => {
-  const phone = normalizePhone(req.body.phone);
-  if (!/^\+?[0-9]{8,15}$/.test(phone)) {
-    return res.status(400).json({ success: false, message: 'Введите корректный номер телефона' });
+function computeBadges(u) {
+  const badges = [];
+  const msgs = u.messagesCount || 0;
+  if (msgs > 50) badges.push('chatterbox');
+  if (msgs > 500) badges.push('helper');
+  if ((u.cosmics || 0) > 100) badges.push('cosmonaut');
+  if (u.createdAt) {
+    const days = (Date.now() - new Date(u.createdAt).getTime()) / 86400000;
+    if (days > 30) badges.push('early_bird');
   }
+  const hour = new Date().getHours();
+  if (hour >= 5 && hour <= 8) badges.push('night_owl');
+  return badges;
+}
+
+function publicUser(u, forSelf = false) {
+  if (!u) return null;
+  return {
+    id: u.id,
+    username: u.username,
+    name: u.name,
+    avatar: u.avatar || '',
+    cosmics: u.cosmics || 0,
+    online: isOnline(u.username),
+    bio: u.bio || '',
+    status: u.status || '',
+    badges: computeBadges(u),
+    messagesCount: u.messagesCount || 0,
+    contactsCount: u.contactsCount || 0,
+    createdAt: u.createdAt || '',
+    lastSeen: db.presence[u.username]
+      ? new Date(db.presence[u.username]).toISOString()
+      : (u.createdAt || ''),
+    phone: forSelf ? (u.phone || '') : undefined
+  };
+}
+
+function countContacts(username) {
+  const contacts = new Set();
+  db.messages.forEach(m => {
+    if (m.from === username) contacts.add(m.to);
+    if (m.to === username) contacts.add(m.from);
+  });
+  return contacts.size;
+}
+
+function checkAdmin(admin, password) {
+  return clean(admin) === clean(ADMIN_LOGIN) && password === ADMIN_PASSWORD;
+}
+
+// ============================================================
+//                       AUTH
+// ============================================================
+app.post('/auth/request-code', (req, res) => {
+  const phone = String(req.body.phone || '').trim();
+  if (!phone) return res.status(400).json({ error: 'phone required' });
 
   const code = String(Math.floor(100000 + Math.random() * 900000));
-  const expiresAt = Date.now() + 5 * 60 * 1000;
-  pendingAuth.set(phone, { code, expiresAt });
+  db.codes[phone] = { code, expiresAt: Date.now() + CODE_TTL_MS };
+  saveDb();
 
-  console.log(`[CosmoMes] Verification code for ${phone}: ${code}`);
-  const existing = users.find(u => u.phone === phone);
-
-  res.json({
-    success: true,
-    exists: !!existing,
-    message: 'Код подтверждения создан',
-    demoCode: code
-  });
+  console.log(`📱 [CODE] ${phone} → ${code}`);
+  res.json({ ok: true, demoCode: code });
 });
 
 app.post('/auth/verify-code', (req, res) => {
-  const phone = normalizePhone(req.body.phone);
-  const code = clean(req.body.code);
-  const record = pendingAuth.get(phone);
+  const phone = String(req.body.phone || '').trim();
+  const code = String(req.body.code || '').trim();
+  const entry = db.codes[phone];
 
-  if (!record || record.expiresAt < Date.now() || record.code !== code) {
-    return res.status(400).json({ success: false, message: 'Неверный или просроченный код' });
+  if (!entry || entry.code !== code || Date.now() > entry.expiresAt) {
+    return res.status(400).json({ error: 'invalid or expired code' });
   }
 
-  pendingAuth.delete(phone);
-  const user = users.find(u => u.phone === phone);
+  delete db.codes[phone];
+  saveDb();
 
-  if (user) {
-    user.online = true;
-    return res.json({ success: true, registered: true, user: publicUser(user) });
-  }
-
-  res.json({ success: true, registered: false, phone });
+  const user = db.users.find(u => u.phone === phone);
+  res.json({ ok: true, user: user ? { username: user.username } : null });
 });
 
 app.post('/register', (req, res) => {
-  const phone = normalizePhone(req.body.phone);
-  const username = clean(req.body.username).replace(/^@/, '');
-  const name = clean(req.body.name);
-  const avatar = clean(req.body.avatar);
+  const name = String(req.body.name || '').trim();
+  const username = clean(req.body.username);
+  const phone = String(req.body.phone || '').trim();
+  const avatar = String(req.body.avatar || '');
 
-  if (!/^\+?[0-9]{8,15}$/.test(phone)) {
-    return res.status(400).json({ success: false, message: 'Неверный номер телефона' });
-  }
-  if (!validUsername(username)) {
-    return res.status(400).json({ success: false, message: 'Username: 3–32 символа, только латиница, цифры и _' });
-  }
-  if (!name || name.length > 50) {
-    return res.status(400).json({ success: false, message: 'Введите имя' });
-  }
-  if (users.some(u => u.phone === phone)) {
-    return res.status(409).json({ success: false, message: 'Этот номер уже зарегистрирован' });
+  if (!name || username.length < 3) {
+    return res.status(400).json({ error: 'invalid name or username' });
   }
   if (findUser(username)) {
-    return res.status(409).json({ success: false, message: 'Этот username уже занят' });
+    return res.status(409).json({ error: 'username taken' });
+  }
+  if (phone && db.users.find(u => u.phone === phone)) {
+    return res.status(409).json({ error: 'phone already registered' });
   }
 
   const user = {
-    id: users.length + 1,
-    phone,
+    id: db.nextUserId++,
     username,
     name,
-    avatar: avatar.slice(0, 500000),
-    cosmics: 0,
-    online: true
+    phone,
+    avatar,
+    cosmics: 100,
+    bio: '',
+    status: '',
+    messagesCount: 0,
+    contactsCount: 0,
+    banned: false,
+    createdAt: new Date().toISOString()
   };
-  users.push(user);
-  res.json({ success: true, user: publicUser(user) });
+  db.users.push(user);
+
+  db.transactions.push({
+    id: db.nextTxId++,
+    username,
+    amount: 100,
+    type: 'welcome',
+    description: 'Приветственный бонус',
+    createdAt: new Date().toISOString()
+  });
+
+  saveDb();
+  console.log(`✨ Новый юзер: @${username}`);
+  res.json({ ok: true, user: publicUser(user, true) });
 });
 
-app.post('/login', (req, res) => {
-  const phone = normalizePhone(req.body.phone);
-  const user = users.find(u => u.phone === phone);
-  if (!user) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
-  user.online = true;
-  res.json({ success: true, user: publicUser(user) });
-});
-
-app.post('/presence', (req, res) => {
-  const user = findUser(req.body.username);
-  if (!user) return res.status(404).json({ success: false });
-  user.online = !!req.body.online;
-  res.json({ success: true });
-});
-
-app.get('/users', (_req, res) => {
-  res.json({ users: users.map(publicUser) });
+// ============================================================
+//                       USERS
+// ============================================================
+app.get('/users', (req, res) => {
+  res.json(db.users.filter(u => !u.banned).map(u => publicUser(u)));
 });
 
 app.get('/profile', (req, res) => {
-  const user = findUser(req.query.username);
-  if (!user) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
-  res.json(publicUser(user));
+  const username = clean(req.query.username);
+  const viewer = clean(req.query.viewer);
+  const user = findUser(username);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  if (user.banned) return res.status(403).json({ error: 'user banned' });
+  res.json(publicUser(user, viewer === username));
 });
 
 app.post('/profile', (req, res) => {
-  const user = findUser(req.body.username);
-  if (!user) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
+  const username = clean(req.body.username);
+  const user = findUser(username);
+  if (!user) return res.status(404).json({ error: 'user not found' });
 
   if (req.body.name !== undefined) {
-    const name = clean(req.body.name);
-    if (!name || name.length > 50) return res.status(400).json({ success: false, message: 'Некорректное имя' });
-    user.name = name;
+    user.name = String(req.body.name).trim().slice(0, 60);
   }
-  if (req.body.avatar !== undefined) user.avatar = clean(req.body.avatar).slice(0, 500000);
+  if (req.body.avatar !== undefined) {
+    user.avatar = String(req.body.avatar).slice(0, 2_000_000);
+  }
+  if (req.body.bio !== undefined) {
+    user.bio = String(req.body.bio).trim().slice(0, 120);
+  }
+  if (req.body.status !== undefined) {
+    user.status = String(req.body.status).trim().slice(0, 60);
+  }
 
-  res.json({ success: true, user: publicUser(user) });
+  saveDb();
+  res.json({ ok: true, user: publicUser(user, true) });
 });
 
+// ============================================================
+//                       SEARCH
+// ============================================================
+app.get('/search', (req, res) => {
+  const q = String(req.query.q || '').toLowerCase().trim();
+  const limit = Math.min(parseInt(req.query.limit) || 20, 50);
+
+  if (q.length < 2) return res.json([]);
+
+  const results = db.users
+    .filter(u => !u.banned)
+    .filter(u =>
+      u.username.includes(q) ||
+      (u.name || '').toLowerCase().includes(q)
+    )
+    .slice(0, limit)
+    .map(u => publicUser(u));
+
+  res.json(results);
+});
+
+// ============================================================
+//                       PRESENCE
+// ============================================================
+app.post('/presence', (req, res) => {
+  const username = clean(req.body.username);
+  if (!findUser(username)) return res.status(404).json({ error: 'user not found' });
+  db.presence[username] = Date.now();
+  res.json({ ok: true });
+});
+
+// ============================================================
+//                       MESSAGES
+// ============================================================
 app.get('/messages', (req, res) => {
-  const a = clean(req.query.user1).replace(/^@/, '').toLowerCase();
-  const b = clean(req.query.user2).replace(/^@/, '').toLowerCase();
-  const result = messages.filter(m =>
+  const a = clean(req.query.user1);
+  const b = clean(req.query.user2);
+  const list = db.messages.filter(m =>
     (m.from === a && m.to === b) || (m.from === b && m.to === a)
   );
-  res.json({ messages: result });
+  res.json(list);
 });
 
 app.post('/messages', (req, res) => {
-  const from = clean(req.body.from).replace(/^@/, '').toLowerCase();
-  const to = clean(req.body.to).replace(/^@/, '').toLowerCase();
-  const text = clean(req.body.text);
-  if (!from || !to || !text) return res.status(400).json({ success: false, message: 'Пустое сообщение' });
+  const from = clean(req.body.from);
+  const to = clean(req.body.to);
+  const text = String(req.body.text || '');
 
-  const message = {
-    id: messages.length + 1,
+  if (!from || !to || !text) return res.status(400).json({ error: 'missing fields' });
+
+  const sender = findUser(from);
+  const receiver = findUser(to);
+  if (!sender || !receiver) return res.status(404).json({ error: 'user not found' });
+  if (receiver.banned) return res.status(403).json({ error: 'receiver banned' });
+
+  const msg = {
+    id: db.nextMsgId++,
     from,
     to,
-    text: text.slice(0, 4000),
-    time: new Date().toISOString()
+    text: text.slice(0, 500_000),
+    createdAt: new Date().toISOString()
   };
-  messages.push(message);
-  res.json({ success: true, message });
+  db.messages.push(msg);
+
+  sender.messagesCount = (sender.messagesCount || 0) + 1;
+  sender.cosmics = (sender.cosmics || 0) + 1;
+
+  if (db.messages.length > 100_000) {
+    db.messages = db.messages.slice(-50_000);
+  }
+
+  saveDb();
+  res.json({ ok: true, message: msg });
 });
 
+// ============================================================
+//                       COSMICS
+// ============================================================
 app.get('/cosmics', (req, res) => {
-  const user = findUser(req.query.username);
-  if (!user) return res.status(404).json({ success: false });
-  res.json({ cosmics: user.cosmics || 0 });
+  const username = clean(req.query.username);
+  const user = findUser(username);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+
+  const history = db.transactions
+    .filter(t => t.username === username)
+    .slice(-100)
+    .reverse();
+
+  res.json({ balance: user.cosmics || 0, history });
 });
 
-app.post('/cosmics/give', (req, res) => {
-  const from = findUser(req.body.from);
-  const to = findUser(req.body.to);
-  const amount = Math.floor(Number(req.body.amount));
-  if (!to || !Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Некорректные данные' });
-  if (from && from.cosmics < amount) return res.status(400).json({ success: false, message: 'Недостаточно космиков' });
-  if (from) from.cosmics -= amount;
-  to.cosmics = (to.cosmics || 0) + amount;
-  transactions.push({ from: from?.username || 'system', to: to.username, amount, time: new Date().toISOString() });
-  res.json({ success: true, cosmics: to.cosmics });
+// ============================================================
+//                       STATS
+// ============================================================
+app.get('/stats', (req, res) => {
+  const username = clean(req.query.username);
+  const user = findUser(username);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+
+  const msgs = db.messages.filter(m => m.from === username || m.to === username).length;
+  const online = db.users.filter(u => isOnline(u.username)).length;
+
+  const created = user.createdAt ? new Date(user.createdAt).getTime() : Date.now();
+  const days = Math.max(1, Math.floor((Date.now() - created) / 86400000));
+
+  res.json({
+    messages: msgs,
+    online,
+    cosmics: user.cosmics || 0,
+    days,
+    contacts: countContacts(username)
+  });
 });
 
-app.get('/gifts/catalog', (_req, res) => {
-  res.json({ gifts: [
-    { id: 'star', name: 'Звезда', price: 10, emoji: '⭐' },
-    { id: 'planet', name: 'Планета', price: 25, emoji: '🪐' },
-    { id: 'rocket', name: 'Ракета', price: 50, emoji: '🚀' },
-    { id: 'galaxy', name: 'Галактика', price: 100, emoji: '🌌' }
-  ]});
-});
+// ============================================================
+//                       AI / BOT
+// ============================================================
+app.post('/ai/chat', (req, res) => {
+  const text = String(req.body.text || '').trim();
+  const username = clean(req.body.username);
+  if (!text) return res.status(400).json({ error: 'text required' });
 
-app.post('/gifts/send', (req, res) => {
-  const from = findUser(req.body.from);
-  const to = findUser(req.body.to);
-  const catalog = {
-    star: ['Звезда', 10, '⭐'],
-    planet: ['Планета', 25, '🪐'],
-    rocket: ['Ракета', 50, '🚀'],
-    galaxy: ['Галактика', 100, '🌌']
-  };
-  const item = catalog[clean(req.body.giftId)];
-  if (!from || !to || !item) return res.status(400).json({ success: false, message: 'Некорректные данные' });
-  if ((from.cosmics || 0) < item[1]) return res.status(400).json({ success: false, message: 'Недостаточно космиков' });
-  from.cosmics -= item[1];
-  gifts.push({ from: from.username, to: to.username, giftId: req.body.giftId, name: item[0], emoji: item[2], time: new Date().toISOString() });
-  res.json({ success: true, cosmics: from.cosmics });
-});
+  const user = findUser(username);
 
-app.get('/gifts', (req, res) => {
-  const username = clean(req.query.username).replace(/^@/, '').toLowerCase();
-  res.json({ gifts: gifts.filter(g => g.to === username || g.from === username) });
+  // Простые ответы (можно заменить на OpenAI API)
+  const lower = text.toLowerCase();
+
+  let reply;
+  if (lower.includes('привет') || lower.includes('hello')) {
+    reply = `Привет${user ? ', @' + user.username : ''}! Чем могу помочь? 👋`;
+  } else if (lower.includes('как дела')) {
+    reply = 'Отлично! Все процессы работают штатно. А у тебя?';
+  } else if (lower.includes('космик')) {
+    reply = `У тебя ${user ? user.cosmics : 0} ✦. Копи на мечту!`;
+  } else if (lower.includes('спасибо')) {
+    reply = 'Всегда рад помочь! 😊';
+  } else if (lower.includes('?')) {
+    reply = 'Хороший вопрос! Дай подумать... 🤔\n\nЯ бы сказал, что всё зависит от контекста. Расскажи подробнее.';
+  } else {
+    const replies = [
+      "Интересная мысль! Расскажи подробнее.",
+      "Понял тебя. А что ты об этом думаешь?",
+      "Согласен на все 100%. Что дальше?",
+      "Хм, давай разберём это вместе.",
+      `Кстати, у тебя уже ${user ? user.cosmics : 0} ✦. Неплохо!`,
+      "Я всегда рядом, если что 😊",
+      "Расскажи, как прошёл твой день?",
+      "Мне нравится ход твоих мыслей! ✨"
+    ];
+    reply = replies[Math.floor(Math.random() * replies.length)];
+  }
+
+  res.json({ reply });
 });
 
 app.post('/bot', (req, res) => {
-  const command = clean(req.body.command);
-  const parts = command.split(/\s+/);
-  if (parts[0] !== '/give' || parts.length !== 3) {
-    return res.status(400).json({ success: false, message: 'Использование: /give @username количество' });
+  const username = clean(req.body.username);
+  const text = String(req.body.text || '').trim().toLowerCase();
+  const user = findUser(username);
+
+  if (text === '/balance') {
+    return res.json({ reply: `У тебя ${user ? user.cosmics : 0} ✦ космиков.` });
   }
-  const to = findUser(parts[1]);
-  const amount = Math.floor(Number(parts[2]));
-  if (!to || !Number.isFinite(amount) || amount <= 0) return res.status(400).json({ success: false, message: 'Некорректная команда' });
-  to.cosmics = (to.cosmics || 0) + amount;
-  transactions.push({ from: 'CosmoBot', to: to.username, amount, time: new Date().toISOString() });
-  res.json({ success: true, message: `Начислено ${amount} космиков пользователю @${to.username}`, cosmics: to.cosmics });
+
+  if (text === '/help') {
+    return res.json({
+      reply: '📖 Команды:\n' +
+        '/balance — баланс\n' +
+        '/give — получить 10 ✦\n' +
+        '/gifts — подарки\n' +
+        '/top — топ юзеров\n' +
+        '/help — помощь'
+    });
+  }
+
+  if (text === '/give') {
+    if (user) {
+      user.cosmics = (user.cosmics || 0) + 10;
+      db.transactions.push({
+        id: db.nextTxId++,
+        username,
+        amount: 10,
+        type: 'gift',
+        description: 'Бонус от CosmoAI',
+        createdAt: new Date().toISOString()
+      });
+      saveDb();
+    }
+    return res.json({ reply: 'Держи 10 ✦! Используй с умом. 🎁' });
+  }
+
+  if (text === '/gifts') {
+    return res.json({
+      reply: '🎁 Доступные подарки:\n' +
+        '• Стикерпак «Космос» — 50 ✦\n' +
+        '• Тема «Галактика» — 100 ✦\n' +
+        '• Премиум на месяц — 500 ✦'
+    });
+  }
+
+  if (text === '/top') {
+    const top = [...db.users]
+      .sort((a, b) => (b.cosmics || 0) - (a.cosmics || 0))
+      .slice(0, 5)
+      .map((u, i) => `${i + 1}. @${u.username} — ${u.cosmics} ✦`)
+      .join('\n');
+    return res.json({ reply: '🏆 Топ-5:\n' + top });
+  }
+
+  res.json({ reply: '❓ Неизвестная команда. Попробуй /help' });
 });
 
-app.post('/admin/login', (req, res) => {
-  if (!ADMIN_PASSWORD || clean(req.body.password) !== ADMIN_PASSWORD) {
-    return res.status(401).json({ success: false, message: 'Неверный пароль' });
+// ============================================================
+//                       BLOCK
+// ============================================================
+app.post('/block', (req, res) => {
+  const username = clean(req.body.username);
+  const target = clean(req.body.target);
+  if (!findUser(username) || !findUser(target)) {
+    return res.status(404).json({ error: 'user not found' });
   }
-  res.json({ success: true });
+  res.json({ ok: true });
+});
+
+// ============================================================
+//                       ADMIN
+// ============================================================
+app.post('/admin/login', (req, res) => {
+  const admin = clean(req.body.username);
+  const password = String(req.body.password || '');
+  if (!checkAdmin(admin, password)) {
+    return res.status(403).json({ error: 'invalid credentials' });
+  }
+  res.json({ ok: true });
 });
 
 app.get('/admin/users', (req, res) => {
-  if (!ADMIN_PASSWORD || clean(req.query.password) !== ADMIN_PASSWORD) return res.status(401).json({ success: false });
-  res.json({ users: users.map(publicUser), transactions });
+  const admin = clean(req.query.admin);
+  const password = String(req.query.password || '');
+  if (!checkAdmin(admin, password)) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+
+  res.json(db.users.map(u => ({
+    id: u.id,
+    username: u.username,
+    name: u.name,
+    avatar: u.avatar || '',
+    cosmics: u.cosmics || 0,
+    online: isOnline(u.username),
+    phone: u.phone || '',
+    createdAt: u.createdAt || '',
+    lastSeen: db.presence[u.username]
+      ? new Date(db.presence[u.username]).toISOString()
+      : (u.createdAt || ''),
+    messagesCount: u.messagesCount || 0,
+    banned: !!u.banned
+  })));
+});
+
+app.post('/admin/ban', (req, res) => {
+  const { admin, password, target } = req.body;
+  if (!checkAdmin(admin, password)) return res.status(403).json({ error: 'forbidden' });
+  const u = findUser(target);
+  if (!u) return res.status(404).json({ error: 'user not found' });
+  u.banned = true;
+  saveDb();
+  console.log(`🚫 BAN: @${u.username}`);
+  res.json({ ok: true });
+});
+
+app.post('/admin/unban', (req, res) => {
+  const { admin, password, target } = req.body;
+  if (!checkAdmin(admin, password)) return res.status(403).json({ error: 'forbidden' });
+  const u = findUser(target);
+  if (!u) return res.status(404).json({ error: 'user not found' });
+  u.banned = false;
+  saveDb();
+  console.log(`✅ UNBAN: @${u.username}`);
+  res.json({ ok: true });
+});
+
+app.post('/admin/delete', (req, res) => {
+  const { admin, password, target } = req.body;
+  if (!checkAdmin(admin, password)) return res.status(403).json({ error: 'forbidden' });
+
+  const t = clean(target);
+  const before = db.users.length;
+  db.users = db.users.filter(u => u.username !== t);
+  db.messages = db.messages.filter(m => m.from !== t && m.to !== t);
+  db.transactions = db.transactions.filter(x => x.username !== t);
+
+  saveDb();
+  console.log(`🗑 DELETE: @${t} (${before - db.users.length} удалено)`);
+  res.json({ ok: true });
 });
 
 app.post('/admin/give', (req, res) => {
-  if (!ADMIN_PASSWORD || clean(req.body.password) !== ADMIN_PASSWORD) return res.status(401).json({ success: false });
-  const user = findUser(req.body.username);
-  const amount = Math.floor(Number(req.body.amount));
-  if (!user || !Number.isFinite(amount)) return res.status(400).json({ success: false, message: 'Некорректные данные' });
-  user.cosmics = (user.cosmics || 0) + amount;
-  transactions.push({ from: 'Admin', to: user.username, amount, time: new Date().toISOString() });
-  res.json({ success: true, cosmics: user.cosmics });
+  const { admin, password, target, amount } = req.body;
+  if (!checkAdmin(admin, password)) return res.status(403).json({ error: 'forbidden' });
+
+  const u = findUser(target);
+  if (!u) return res.status(404).json({ error: 'user not found' });
+
+  const amt = parseInt(amount) || 0;
+  u.cosmics = (u.cosmics || 0) + amt;
+
+  db.transactions.push({
+    id: db.nextTxId++,
+    username: u.username,
+    amount: amt,
+    type: 'admin',
+    description: amt > 0 ? 'Начислено администратором' : 'Списано администратором',
+    createdAt: new Date().toISOString()
+  });
+
+  saveDb();
+  console.log(`💰 GIVE: @${u.username} ${amt > 0 ? '+' : ''}${amt} ✦`);
+  res.json({ ok: true, balance: u.cosmics });
 });
 
-app.post('/ai/chat', async (req, res) => {
-  if (!OPENAI_API_KEY) return res.status(503).json({ success: false, message: 'CosmoAI не настроен: добавьте OPENAI_API_KEY в Render Environment' });
-
-  const username = clean(req.body.username).replace(/^@/, '').toLowerCase();
-  const now = Date.now();
-  const last = aiRate.get(username) || 0;
-  if (now - last < 1200) return res.status(429).json({ success: false, message: 'Слишком часто. Подожди немного.' });
-  aiRate.set(username, now);
-
-  const history = Array.isArray(req.body.messages) ? req.body.messages.slice(-20) : [];
-  const input = history.map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: clean(m.content).slice(0, 4000) }));
-
-  try {
-    const response = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        instructions: 'Ты CosmoAI внутри мессенджера CosmoMes. Общайся естественно, современно и по делу. Не называй интерфейс отдельным сайтом или страницей. Отвечай на русском, если пользователь пишет по-русски. Не будь детским или чрезмерно официальным. Помогай с учёбой, кодом, идеями, играми и обычными вопросами.',
-        input
-      })
-    });
-
-    const data = await response.json();
-    if (!response.ok) {
-      console.error('OpenAI error:', data);
-      return res.status(502).json({ success: false, message: 'CosmoAI временно недоступен' });
-    }
-
-    const text = data.output_text || (data.output || [])
-      .flatMap(item => item.content || [])
-      .map(part => part.text || '')
-      .join('')
-      .trim();
-
-    res.json({ success: true, reply: text || 'Не получилось получить ответ.' });
-  } catch (error) {
-    console.error('AI request failed:', error);
-    res.status(502).json({ success: false, message: 'Ошибка соединения с CosmoAI' });
-  }
+app.post('/admin/broadcast', (req, res) => {
+  const { admin, password, text } = req.body;
+  if (!checkAdmin(admin, password)) return res.status(403).json({ error: 'forbidden' });
+  console.log(`📢 BROADCAST: ${text}`);
+  // Тут можно разослать push-уведомления
+  res.json({ ok: true });
 });
 
+// ============================================================
+//                       HEALTH / ROOT
+// ============================================================
+app.get('/', (req, res) => {
+  res.json({
+    name: 'CosmoMes Server',
+    version: '2.0',
+    status: 'online',
+    stats: {
+      users: db.users.length,
+      messages: db.messages.length,
+      transactions: db.transactions.length,
+      online: db.users.filter(u => isOnline(u.username)).length
+    },
+    endpoints: [
+      'POST /auth/request-code',
+      'POST /auth/verify-code',
+      'POST /register',
+      'GET  /users',
+      'GET  /profile?username=X',
+      'POST /profile',
+      'GET  /search?q=X',
+      'POST /presence',
+      'GET  /messages?user1=X&user2=Y',
+      'POST /messages',
+      'GET  /cosmics?username=X',
+      'GET  /stats?username=X',
+      'POST /ai/chat',
+      'POST /bot',
+      'POST /block',
+      'POST /admin/login',
+      'GET  /admin/users',
+      'POST /admin/ban',
+      'POST /admin/unban',
+      'POST /admin/delete',
+      'POST /admin/give',
+      'POST /admin/broadcast'
+    ]
+  });
+});
+
+// ============================================================
+//                       START
+// ============================================================
 app.listen(PORT, () => {
-  console.log(`CosmoMes server 4.0 running on port ${PORT}`);
+  console.log('');
+  console.log('🚀 ====================================');
+  console.log(`🚀  CosmoMes Server v2.0`);
+  console.log(`🚀  Порт: ${PORT}`);
+  console.log(`🚀  Юзеров: ${db.users.length}`);
+  console.log(`🚀  Сообщений: ${db.messages.length}`);
+  console.log(`🚀  Админ: ${ADMIN_LOGIN} / ${ADMIN_PASSWORD}`);
+  console.log('🚀 ====================================');
+  console.log('');
 });
