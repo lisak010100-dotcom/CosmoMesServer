@@ -96,8 +96,23 @@ app.post('/presence', (req, res) => {
 app.get('/users', (_, res) => res.json(users.map(publicUser)));
 
 app.get('/profile', (req, res) => {
-  const user = findUser(req.query.username);
-  user ? res.json(publicUser(user)) : res.status(404).json({ error: 'Пользователь не найден' });
+  const rawUsername = String(req.query.username || '');
+  const username = clean(rawUsername);
+  const user = findUser(username);
+
+  if (!username) {
+    return res.status(400).json({ error: 'Username не указан' });
+  }
+
+  if (!user) {
+    return res.status(404).json({
+      error: 'Пользователь не найден',
+      username,
+      requested: rawUsername
+    });
+  }
+
+  res.json(publicUser(user));
 });
 
 app.post('/profile', (req, res) => {
