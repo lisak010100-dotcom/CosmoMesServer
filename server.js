@@ -26,6 +26,7 @@ let db = {
   users: [],
   messages: [],
   transactions: [],
+  gifts: [],
   codes: {},       // phone → { code, expiresAt }
   presence: {},    // username → timestamp (ms)
   nextUserId: 1,
@@ -42,6 +43,7 @@ function loadDb() {
       db.users = db.users || [];
       db.messages = db.messages || [];
       db.transactions = db.transactions || [];
+      db.gifts = db.gifts || [];
       db.nextUserId = db.nextUserId || 1;
       db.nextMsgId = db.nextMsgId || 1;
       db.nextTxId = db.nextTxId || 1;
@@ -335,6 +337,60 @@ app.get('/cosmics', (req, res) => {
   res.json({ balance: user.cosmics || 0, history });
 });
 
+
+// ============================================================
+//                       GIFTS
+// ============================================================
+const DEFAULT_GIFTS = [
+  { id: 'rose', name: 'Роза', emoji: '🌹', price: 10, description: 'Маленький знак внимания' },
+  { id: 'star', name: 'Звезда', emoji: '⭐', price: 50, description: 'Яркий подарок' },
+  { id: 'planet', name: 'Планета', emoji: '🪐', price: 150, description: 'Космический подарок' },
+  { id: 'galaxy', name: 'Галактика', emoji: '🌌', price: 500, description: 'Большой космический подарок' }
+];
+
+app.get('/gifts/catalog', (req, res) => res.json(DEFAULT_GIFTS));
+
+app.get('/gifts', (req, res) => {
+  const username = clean(req.query.username);
+  res.json((db.gifts || []).filter(g => g.to === username || g.from === username).slice(-100).reverse());
+});
+
+app.post('/gifts/send', (req, res) => {
+  const from = clean(req.body.from);
+  const to = clean(req.body.to);
+  const giftId = String(req.body.giftId || '');
+  const sender = findUser(from);
+  const receiver = findUser(to);
+  const gift = DEFAULT_GIFTS.find(g => g.id === giftId);
+
+  if (!sender || !receiver) return res.status(404).json({ error: 'user not found' });
+  if (sender.banned || receiver.banned) return res.status(403).json({ error: 'user banned' });
+  if (!gift) return res.status(404).json({ error: 'gift not found' });
+  if (from === to) return res.status(400).json({ error: 'cannot gift yourself' });
+  if ((sender.cosmics || 0) < gift.price) return res.status(400).json({ error: 'not enough cosmics' });
+
+  sender.cosmics -= gift.price;
+  receiver.giftCount = (receiver.giftCount || 0) + 1;
+  const record = {
+    id: String(Date.now()) + '_' + String(db.nextTxId++),
+    giftId: gift.id, name: gift.name, emoji: gift.emoji, price: gift.price,
+    from, to, createdAt: new Date().toISOString()
+  };
+  db.gifts.push(record);
+  db.transactions.push({
+    id: db.nextTxId++, username: from, amount: -gift.price, type: 'gift_sent',
+    description: 'Подарок ' + gift.emoji + ' ' + gift.name + ' → @' + to,
+    createdAt: new Date().toISOString()
+  });
+  db.transactions.push({
+    id: db.nextTxId++, username: to, amount: 0, type: 'gift_received',
+    description: 'Получен подарок ' + gift.emoji + ' ' + gift.name + ' от @' + from,
+    createdAt: new Date().toISOString()
+  });
+  saveDb();
+  res.json({ ok: true, gift: record, balance: sender.cosmics });
+});
+
 // ============================================================
 //                       STATS
 // ============================================================
@@ -599,6 +655,9 @@ app.get('/', (req, res) => {
       'GET  /messages?user1=X&user2=Y',
       'POST /messages',
       'GET  /cosmics?username=X',
+      'GET  /gifts/catalog',
+      'GET  /gifts?username=X',
+      'POST /gifts/send',
       'GET  /stats?username=X',
       'POST /ai/chat',
       'POST /bot',
