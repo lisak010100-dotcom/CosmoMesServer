@@ -110,6 +110,7 @@ function publicUser(u, forSelf = false) {
     badges: computeBadges(u),
     messagesCount: u.messagesCount || 0,
     contactsCount: u.contactsCount || 0,
+    giftCount: u.giftCount || 0,
     createdAt: u.createdAt || '',
     lastSeen: db.presence[u.username]
       ? new Date(db.presence[u.username]).toISOString()
@@ -189,6 +190,7 @@ app.post('/register', (req, res) => {
     status: '',
     messagesCount: 0,
     contactsCount: 0,
+    giftCount: 0,
     banned: false,
     createdAt: new Date().toISOString()
   };
@@ -591,6 +593,8 @@ app.post('/admin/delete', (req, res) => {
   db.users = db.users.filter(u => u.username !== t);
   db.messages = db.messages.filter(m => m.from !== t && m.to !== t);
   db.transactions = db.transactions.filter(x => x.username !== t);
+  db.gifts = (db.gifts || []).filter(g => g.from !== t && g.to !== t);
+  delete db.presence[t];
 
   saveDb();
   console.log(`🗑 DELETE: @${t} (${before - db.users.length} удалено)`);
